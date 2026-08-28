@@ -47,7 +47,7 @@ use tokio_rustls::{
     server::TlsStream,
     TlsAcceptor,
 };
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use uuid::Uuid;
 use zenoh::{
     bytes::{Encoding, ZBytes},
@@ -84,6 +84,7 @@ kedefine!(
 
 const WORKER_THREAD_NUM: usize = 2;
 const MAX_BLOCK_THREAD_NUM: usize = 50;
+const MAX_WEBSOCKET_WRITE_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 
 lazy_static::lazy_static! {
     // The global runtime is used in the dynamic plugins, which we can't get the current runtime
@@ -535,7 +536,14 @@ async fn run_websocket_server(
                 None => Box::new(tcp_stream),
             };
 
-            let ws_stream = match tokio_tungstenite::accept_async(streamable).await {
+            let ws_config =
+                WebSocketConfig::default().max_write_buffer_size(MAX_WEBSOCKET_WRITE_BUFFER_SIZE);
+            let ws_stream = match tokio_tungstenite::accept_async_with_config(
+                streamable,
+                Some(ws_config),
+            )
+            .await
+            {
                 Ok(ws_stream) => ws_stream,
                 Err(e) => {
                     tracing::error!("Error during the websocket handshake occurred: {}", e);
