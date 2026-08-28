@@ -26,6 +26,7 @@ use std::{
     net::SocketAddr,
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use futures::{future, pin_mut, SinkExt, StreamExt, TryStreamExt};
@@ -38,6 +39,7 @@ use tokio::{
     select,
     sync::RwLock,
     task::JoinHandle,
+    time::{self, Instant},
 };
 use tokio_rustls::{
     rustls::{
@@ -84,6 +86,8 @@ kedefine!(
 
 const WORKER_THREAD_NUM: usize = 2;
 const MAX_BLOCK_THREAD_NUM: usize = 50;
+const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const WEBSOCKET_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 
 lazy_static::lazy_static! {
     // The global runtime is used in the dynamic plugins, which we can't get the current runtime
@@ -543,16 +547,30 @@ async fn run_websocket_server(
                 }
             };
 
-            let (ws_tx, ws_rx) = ws_stream.split();
+            let (ws_tx, mut ws_rx) = ws_stream.split();
 
-            let ch_rx_stream = ws_ch_rx
-                .into_stream()
-                .map(|(out_msg, sequence_id)| {
-                    tracing::trace!("<< Send: {:?} (seq={:?})", out_msg.id(), sequence_id);
-                    Ok::<_, Box<tokio_tungstenite::tungstenite::Error>>(Message::Binary(
-                        out_msg.to_wire(sequence_id),
+            let outgoing_messages = ws_ch_rx.into_stream().map(|(out_msg, sequence_id)| {
+                tracing::trace!("<< Send: {:?} (seq={:?})", out_msg.id(), sequence_id);
+                Ok::<_, Box<tokio_tungstenite::tungstenite::Error>>(Message::Binary(
+                    out_msg.to_wire(sequence_id),
+                ))
+            });
+            let heartbeat_messages = futures::stream::unfold(
+                time::interval_at(
+                    Instant::now() + WEBSOCKET_HEARTBEAT_INTERVAL,
+                    WEBSOCKET_HEARTBEAT_INTERVAL,
+                ),
+                |mut interval| async move {
+                    interval.tick().await;
+                    Some((
+                        Ok::<_, Box<tokio_tungstenite::tungstenite::Error>>(Message::Ping(
+                            Vec::new().into(),
+                        )),
+                        interval,
                     ))
-                })
+                },
+            );
+            let ch_rx_stream = futures::stream::select(outgoing_messages, heartbeat_messages)
                 .forward(ws_tx.sink_map_err(Box::new));
 
             // send confirmation that session was successfully opened
@@ -567,9 +585,17 @@ async fn run_websocket_server(
 
             //  Incoming message from Websocket
             let incoming_ws = tokio::task::spawn(async move {
-                let mut non_close_messages = ws_rx.try_filter(|msg| future::ready(!msg.is_close()));
-
-                while let Ok(Some(msg)) = non_close_messages.try_next().await {
+                while let Ok(Some(msg)) =
+                    time::timeout(WEBSOCKET_HEARTBEAT_TIMEOUT, ws_rx.try_next())
+                        .await
+                        .unwrap_or_else(|_| {
+                            tracing::warn!("WebSocket heartbeat timed out");
+                            Ok(None)
+                        })
+                {
+                    if msg.is_close() || matches!(msg, Message::Ping(_) | Message::Pong(_)) {
+                        continue;
+                    }
                     if let Some(response) = handle_message(msg, &mut remote_state).await {
                         if let Err(err) = ws_ch_tx.send(response) {
                             tracing::error!("WS Send Error: {err:?}");
